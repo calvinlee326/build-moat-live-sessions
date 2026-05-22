@@ -70,78 +70,131 @@ def tokenize(text: str) -> list[str]:
 
 
 def parse_markdown(path: Path) -> list[Section]:
-    # TODO: Parse one Markdown file into section-level records.
-    #
-    # Design decision: The retrieval unit is a heading section, not a whole file.
-    #
-    # Hints:
-    # 1. Use HEADING_RE to detect Markdown headings.
-    # 2. Track heading_path so citations include parent context.
-    # 3. Each Section id should look like "refund_policy.md#refund-timeline".
-    # 4. Tokens should include both headings and content.
-    return []
+    filename = path.name
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    result: list[Section] = []
+    heading_stack: list[tuple[int, str]] = []  # (level, text)
+    current_heading: str | None = None
+    current_lines: list[str] = []
+
+    def flush(heading: str, heading_path: list[str], body_lines: list[str]) -> None:
+        content = "\n".join(body_lines).strip()
+        all_tokens = tokenize(heading + " " + content)
+        section_id = f"{filename}#{slugify(heading)}"
+        result.append(Section(
+            id=section_id,
+            file=filename,
+            heading=heading,
+            heading_path=heading_path[:],
+            content=content,
+            tokens=all_tokens,
+        ))
+
+    for line in lines:
+        m = HEADING_RE.match(line)
+        if m:
+            if current_heading is not None:
+                flush(current_heading, [h for _, h in heading_stack], current_lines)
+            level = len(m.group(1))
+            heading_text = m.group(2)
+            # Pop stack entries at same or deeper level
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, heading_text))
+            current_heading = heading_text
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_heading is not None:
+        flush(current_heading, [h for _, h in heading_stack], current_lines)
+
+    return result
 
 
 def write_index_json(index_path: Path = INDEX_PATH) -> None:
-    # TODO: Persist the section index to .kb/index.json so it is inspectable.
-    #
-    # Hints:
-    # 1. Create index_path.parent if it does not exist.
-    # 2. Write {"sections": [...], "stats": {...}} as pretty JSON.
-    # 3. Use section.to_dict() for each Section.
-    _ = json
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "sections": [s.to_dict() for s in sections],
+        "stats": {
+            "files_indexed": files_indexed,
+            "sections_indexed": len(sections),
+            "avg_doc_len": avg_doc_len,
+        },
+    }
+    index_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def rebuild_stats() -> None:
-    # TODO: Rebuild doc_freq, avg_doc_len, and files_indexed from sections.
-    #
-    # Hints:
-    # 1. files_indexed can be derived from the unique section.file values.
-    # 2. doc_freq counts how many sections contain each token.
-    # 3. avg_doc_len is the average token count across sections.
-    pass
+    global doc_freq, avg_doc_len, files_indexed
+    doc_freq = Counter()
+    for section in sections:
+        for token in set(section.tokens):
+            doc_freq[token] += 1
+    avg_doc_len = sum(len(s.tokens) for s in sections) / len(sections) if sections else 0.0
+    files_indexed = len({s.file for s in sections})
 
 
 def load_index_json(index_path: Path = INDEX_PATH) -> tuple[int, int]:
-    # TODO: Load .kb/index.json into the in-memory sections list.
-    #
-    # Hints:
-    # 1. If index_path does not exist, return (0, 0).
-    # 2. Read payload["sections"] and convert each item back to Section.
-    # 3. Call rebuild_stats() after assigning sections.
-    # 4. Return (files_indexed, sections_indexed).
-    return 0, 0
+    global sections
+    if not index_path.exists():
+        return 0, 0
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    sections = [
+        Section(
+            id=item["id"],
+            file=item["file"],
+            heading=item["heading"],
+            heading_path=item["heading_path"],
+            content=item["content"],
+            tokens=item["tokens"],
+        )
+        for item in payload["sections"]
+    ]
+    rebuild_stats()
+    return files_indexed, len(sections)
 
 
 def build_index(docs_dir: Path = DOCS_DIR) -> tuple[int, int]:
     global sections, doc_freq, avg_doc_len, files_indexed
 
-    # TODO: Build an in-memory section index from docs/*.md.
-    #
-    # Hints:
-    # 1. Read all Markdown files from docs_dir.
-    # 2. Call parse_markdown() for each file.
-    # 3. Call rebuild_stats() to compute BM25 metadata.
-    # 4. Persist .kb/index.json with write_index_json().
-    # 5. Call write_index_json() so students can inspect the generated index.
-    # 6. Return (files_indexed, sections_indexed).
     sections = []
     doc_freq = Counter()
     avg_doc_len = 0.0
     files_indexed = 0
+
+    for md_file in sorted(docs_dir.glob("*.md")):
+        sections.extend(parse_markdown(md_file))
+
+    rebuild_stats()
     write_index_json()
     return files_indexed, len(sections)
 
 
 def bm25_score(query_tokens: list[str], section: Section, k1: float = 1.5, b: float = 0.75) -> float:
-    # TODO: Score one section for the query using BM25.
-    #
-    # Hints:
-    # 1. Count term frequency in the section.
-    # 2. Use doc_freq to give rare terms higher weight.
-    # 3. Normalize by section length using avg_doc_len.
-    # 4. Add a small boost when query terms appear in heading_path.
-    return 0.0
+    if not query_tokens or not section.tokens:
+        return 0.0
+
+    N = len(sections)
+    dl = len(section.tokens)
+    tf_map = Counter(section.tokens)
+    score = 0.0
+
+    for token in query_tokens:
+        tf = tf_map.get(token, 0)
+        if tf == 0:
+            continue
+        df = doc_freq.get(token, 0)
+        idf = math.log((N - df + 0.5) / (df + 0.5) + 1)
+        tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_doc_len))
+        score += idf * tf_norm
+
+        # Small heading boost
+        if token in tokenize(" ".join(section.heading_path)):
+            score += 0.5
+
+    return score
 
 
 def search(query: str, k: int = 3) -> list[tuple[Section, float]]:

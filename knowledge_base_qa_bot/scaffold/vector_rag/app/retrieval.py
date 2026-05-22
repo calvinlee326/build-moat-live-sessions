@@ -6,16 +6,13 @@ from langchain_openai import ChatOpenAI
 from . import indexer
 
 
-SYSTEM_PROMPT = """
-# TODO: Write the system prompt for the knowledge base Q&A assistant.
-#
-# Design decision: Hallucination defense for retrieved chunks.
-#
-# Hints:
-# 1. Only answer using the provided CONTEXT.
-# 2. Cite sources using filename#heading.
-# 3. Define fallback behavior when the context lacks the answer.
-# 4. Explicitly prohibit guessing or outside knowledge.
+SYSTEM_PROMPT = """You are a knowledge base assistant. Answer questions using ONLY the CONTEXT provided below.
+
+Rules:
+- Cite every fact with its source in the format [filename#heading].
+- If the context does not contain enough information to answer, reply exactly: "I cannot confirm from the knowledge base."
+- Do not guess, infer, or use any knowledge outside the provided CONTEXT.
+- Keep answers concise and grounded in the source text.
 """
 
 _llm = None
@@ -33,16 +30,12 @@ def get_llm():
 
 
 def build_prompt(query: str, ranked_chunks: list) -> str:
-    # TODO: Build the prompt from retrieved vector chunks.
-    #
-    # Design decision: Give the LLM enough context without flooding it.
-    #
-    # Hints:
-    # 1. Include [Source: filename#heading] before each chunk.
-    # 2. Include retrieval distance or score only for debugging.
-    # 3. Use top-k chunks passed into this function.
-    # 4. Place CONTEXT before QUESTION.
-    return f"CONTEXT:\n(no context)\n\nQUESTION:\n{query}"
+    context_parts = []
+    for doc, _score in ranked_chunks:
+        source = doc.metadata.get("source", "unknown")
+        context_parts.append(f"[Source: {source}]\n{doc.page_content}")
+    context = "\n\n---\n\n".join(context_parts)
+    return f"CONTEXT:\n{context}\n\nQUESTION:\n{query}"
 
 
 def query(question: str) -> dict:
