@@ -1,5 +1,8 @@
 # Knowledge Base Q&A Bot
 
+> Part of the **現代系統設計** live session series by Terry & Bohr.
+> Original repo: [bohr109/build-moat-live-sessions](https://github.com/bohr109/build-moat-live-sessions)
+
 ## How to Use
 
 1. Read `PROMPT.md`
