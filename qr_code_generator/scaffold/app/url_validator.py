@@ -17,14 +17,18 @@ def is_blocked_domain(hostname: str | None) -> bool:
 
 def validate_url(url: str) -> str:
     """Format check, normalization, and blocklist validation."""
-    # TODO: Implement this function
-    #
-    # Design decision: normalization keeps the same destination URL mapping to
-    # the same token (no duplicates); blocklist validation prevents short links
-    # from becoming phishing vectors.
-    #
-    # Hints:
-    # 1. Validate: length within MAX_URL_LENGTH, scheme is http/https via
-    #    urlparse(), hostname is not in is_blocked_domain(). Raise ValueError otherwise.
-    # 2. Normalize and return: lowercase, strip trailing slash, upgrade http→https.
-    raise NotImplementedError("validate_url() is not yet implemented")
+    if len(url) > MAX_URL_LENGTH:
+        raise ValueError(f"URL exceeds maximum length of {MAX_URL_LENGTH}")
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("URL must use http or https scheme")
+    if is_blocked_domain(parsed.hostname):
+        raise ValueError(f"Domain '{parsed.hostname}' is blocked")
+
+    # Normalize: upgrade to https, lowercase host, strip trailing slash
+    normalized = parsed._replace(
+        scheme="https",
+        netloc=parsed.netloc.lower(),
+    ).geturl().rstrip("/")
+    return normalized
