@@ -1,13 +1,11 @@
 import os
 
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from . import indexer
 
 
-# Explicit system prompt prevents the LLM from using its own knowledge
-# and forces it to cite sources — critical for a grounded Q&A bot.
 SYSTEM_PROMPT = """You are a knowledge base assistant. Answer questions using ONLY the CONTEXT provided below.
 
 Rules:

@@ -1,14 +1,11 @@
 import os
 
-from langchain.schema import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from . import indexer
 
 
-# The system prompt defines the LLM's behavior for every /chat call.
-# Being explicit about "only use CONTEXT" and "say you cannot confirm"
-# prevents hallucination — the LLM making up answers not in the docs.
 SYSTEM_PROMPT = """You are a knowledge base assistant. Answer questions using ONLY the CONTEXT provided below.
 
 Rules:
