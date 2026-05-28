@@ -15,7 +15,9 @@ from .url_validator import validate_url
 
 router = APIRouter()
 
-# In-memory cache (simulates Redis for prototype)
+# In-memory dict simulating a Redis cache.
+# Key = token string, Value = destination URL.
+# Avoids hitting the DB on every QR scan (the hottest path).
 redirect_cache: dict[str, str] = {}
 
 BASE_URL = "http://localhost:8000"
@@ -23,10 +25,12 @@ BASE_URL = "http://localhost:8000"
 
 @router.post("/api/qr/create", response_model=CreateResponse)
 def create_qr(req: CreateRequest, db: Session = Depends(get_db)):
-    try:                                                                                                                                                           
-        normalized_url = validate_url(req.url)                
-    except ValueError as e:                                                                                                                                        
+    # Validate and normalize before storing — keeps DB clean
+    try:
+        normalized_url = validate_url(req.url)
+    except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+
     token = generate_token(normalized_url, db)
 
     mapping = UrlMapping(
@@ -39,7 +43,7 @@ def create_qr(req: CreateRequest, db: Session = Depends(get_db)):
 
     short_url = f"{BASE_URL}/r/{token}"
 
-    # Warm cache
+    # Warm the cache on create so the very first scan skips the DB entirely
     redirect_cache[token] = normalized_url
 
     return CreateResponse(
@@ -52,21 +56,30 @@ def create_qr(req: CreateRequest, db: Session = Depends(get_db)):
 
 @router.get("/r/{token}")
 def redirect(token: str, request: Request, db: Session = Depends(get_db)):
-    """Redirect fallback flow: Cache -> DB -> 404/410 (from slides mermaid diagram)"""
-    # Cache hit
+    """Redirect flow: Cache → DB → 410/404.
+
+    This is the hot path — every QR scan hits this endpoint.
+    Cache-first keeps DB load low. We still hit the DB on first scan
+    after restart or after a cache invalidation (update/delete).
+    """
+    # Fast path: return from cache without touching the DB
     if token in redirect_cache:
         _record_scan(token, request, db)
         return RedirectResponse(url=redirect_cache[token], status_code=302)
 
-    # Cache miss — check DB
+    # Slow path: cache miss, look up in DB
     mapping = db.query(UrlMapping).filter(UrlMapping.token == token).first()
     if mapping is None:
         raise HTTPException(status_code=404, detail="Not Found")
+
+    # 410 Gone (not 404) signals "existed but was removed" — useful for QR
+    # codes printed on physical materials where users expect a real page
     if mapping.is_deleted:
         raise HTTPException(status_code=410, detail="Gone")
     if mapping.expires_at and mapping.expires_at < datetime.utcnow():
         raise HTTPException(status_code=410, detail="Gone")
 
+    # Warm cache for future scans, then redirect
     redirect_cache[token] = mapping.original_url
     _record_scan(token, request, db)
     return RedirectResponse(url=mapping.original_url, status_code=302)
@@ -87,15 +100,16 @@ def update_qr(token: str, req: UpdateRequest, db: Session = Depends(get_db)):
             mapping.original_url = validate_url(req.url)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
-        # Invalidate cache
+        # Must evict cache so next scan fetches the updated URL from DB
         redirect_cache.pop(token, None)
 
     if req.expires_at is not None:
         mapping.expires_at = req.expires_at
-        # Invalidate cache
+        # Evict so expiry is rechecked on next scan
         redirect_cache.pop(token, None)
 
     db.commit()
+    # refresh() re-reads the row from DB so the response reflects db defaults/triggers
     db.refresh(mapping)
     return mapping
 
@@ -103,10 +117,10 @@ def update_qr(token: str, req: UpdateRequest, db: Session = Depends(get_db)):
 @router.delete("/api/qr/{token}")
 def delete_qr(token: str, db: Session = Depends(get_db)):
     mapping = _get_mapping_or_404(token, db)
+    # Soft delete: keep the row so we can return 410 instead of 404
     mapping.is_deleted = True
     db.commit()
-    # Invalidate cache
-    redirect_cache.pop(token, None)
+    redirect_cache.pop(token, None)  # evict so next scan goes to DB and sees is_deleted
     return {"detail": "Deleted"}
 
 
@@ -115,10 +129,12 @@ def get_qr_image(token: str, db: Session = Depends(get_db)):
     _get_mapping_or_404(token, db)
     short_url = f"{BASE_URL}/r/{token}"
 
+    # qrcode.make() generates a PIL image of the QR code
     img = qrcode.make(short_url)
+    # BytesIO is an in-memory file — avoids writing to disk
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    buf.seek(0)
+    buf.seek(0)  # rewind to start so the response reads from the beginning
     return StreamingResponse(buf, media_type="image/png")
 
 
@@ -128,6 +144,7 @@ def get_analytics(token: str, db: Session = Depends(get_db)):
 
     total = db.query(func.count(ScanEvent.id)).filter(ScanEvent.token == token).scalar()
 
+    # GROUP BY date extracts the date part from the timestamp for daily bucketing
     daily = (
         db.query(
             func.date(ScanEvent.scanned_at).label("date"),
@@ -146,6 +163,7 @@ def get_analytics(token: str, db: Session = Depends(get_db)):
 
 
 def _get_mapping_or_404(token: str, db: Session) -> UrlMapping:
+    # Shared helper so every endpoint uses the same not-found logic
     mapping = db.query(UrlMapping).filter(UrlMapping.token == token).first()
     if mapping is None or mapping.is_deleted:
         raise HTTPException(status_code=404, detail="Not Found")
@@ -153,6 +171,7 @@ def _get_mapping_or_404(token: str, db: Session) -> UrlMapping:
 
 
 def _record_scan(token: str, request: Request, db: Session):
+    # Write one analytics row per redirect — used by the /analytics endpoint
     event = ScanEvent(
         token=token,
         user_agent=request.headers.get("user-agent"),

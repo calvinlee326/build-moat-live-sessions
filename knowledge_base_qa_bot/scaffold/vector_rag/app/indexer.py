@@ -15,12 +15,17 @@ INDEX_DIR = Path(__file__).resolve().parents[3] / ".kb" / "faiss_index"
 EMBEDDING_MODEL = "text-embedding-3-small"
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
+# RecursiveCharacterTextSplitter breaks long sections into overlapping chunks.
+# chunk_overlap=50 means adjacent chunks share 50 characters — this prevents
+# a fact from being cut exactly at the boundary and becoming unsearchable.
+# separators tries to split at paragraph breaks before individual words.
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=500,
     chunk_overlap=50,
     separators=["\n\n", "\n", ". ", " "],
 )
 
+# Module-level globals — populated by build_index() and used by search()
 vectorstore: FAISS | None = None
 _embeddings = None
 files_indexed = 0
@@ -33,6 +38,11 @@ def slugify(text: str) -> str:
 
 
 def get_embeddings():
+    """Lazily initialize the OpenAI embeddings client.
+
+    Lazy init avoids connecting to OpenAI at import time, so the server
+    can start even if the API key isn't set (it'll only fail on first use).
+    """
     global _embeddings
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set in the server environment")
@@ -46,6 +56,15 @@ def get_embeddings():
 
 
 def load_markdown_sections(path: Path) -> list[Document]:
+    """Parse one Markdown file into heading-level Document objects.
+
+    Each section becomes a Document with:
+    - page_content: breadcrumb + body text (what gets embedded)
+    - metadata.source: "filename.md#heading-slug" (used for citations)
+
+    Including the breadcrumb in page_content helps embeddings understand
+    the document hierarchy, not just the raw body text.
+    """
     filename = path.name
     lines = path.read_text(encoding="utf-8").splitlines()
     docs: list[Document] = []
@@ -56,7 +75,7 @@ def load_markdown_sections(path: Path) -> list[Document]:
     def flush(heading: str, body_lines: list[str]) -> None:
         content = "\n".join(body_lines).strip()
         if not content:
-            return
+            return  # skip empty sections (e.g. headings with no body text)
         breadcrumb = " > ".join(h for _, h in heading_stack)
         section_id = f"{filename}#{slugify(heading)}"
         docs.append(Document(
@@ -86,6 +105,14 @@ def load_markdown_sections(path: Path) -> list[Document]:
 
 
 def build_index(docs_dir: Path = DOCS_DIR) -> tuple[int, int]:
+    """Build a FAISS vector index from all docs/*.md files.
+
+    Steps:
+    1. Parse each Markdown file into heading-level Documents
+    2. Split into chunks (each chunk gets its own embedding)
+    3. Embed all chunks via OpenAI and store in FAISS
+    4. Persist to disk so restart doesn't require re-embedding
+    """
     global vectorstore, files_indexed, sections_indexed
 
     all_docs: list[Document] = []
@@ -93,7 +120,10 @@ def build_index(docs_dir: Path = DOCS_DIR) -> tuple[int, int]:
     for md_file in md_files:
         all_docs.extend(load_markdown_sections(md_file))
 
+    # split_documents respects separators and preserves metadata from parent Documents
     chunks = splitter.split_documents(all_docs)
+
+    # FAISS.from_documents() calls the embedding API once per chunk and builds the index
     vectorstore = FAISS.from_documents(chunks, get_embeddings())
 
     files_indexed = len(md_files)
@@ -104,12 +134,20 @@ def build_index(docs_dir: Path = DOCS_DIR) -> tuple[int, int]:
 
 
 def save_vector_index(index_dir: Path = INDEX_DIR) -> None:
+    """Persist the FAISS index to disk so restart skips re-embedding.
+
+    Re-embedding costs API credits and takes seconds — saving once and
+    reloading is much cheaper for a static knowledge base.
+    """
     if vectorstore is None:
         return
+    # Remove stale index before saving a fresh one to avoid mixing old/new vectors
     if index_dir.exists():
         shutil.rmtree(index_dir)
     index_dir.mkdir(parents=True, exist_ok=True)
+    # Saves index.faiss (the vector data) and index.pkl (the document metadata)
     vectorstore.save_local(str(index_dir))
+    # Write metadata so load_vector_index() can verify the embedding model hasn't changed
     metadata = {
         "embedding_model": EMBEDDING_MODEL,
         "files_indexed": files_indexed,
@@ -119,15 +157,22 @@ def save_vector_index(index_dir: Path = INDEX_DIR) -> None:
 
 
 def load_vector_index(index_dir: Path = INDEX_DIR) -> tuple[int, int]:
+    """Load a previously saved FAISS index on server startup.
+
+    allow_dangerous_deserialization=True is required by LangChain because
+    FAISS uses pickle internally. It's safe here because we wrote the index
+    ourselves from trusted local files — never load untrusted pickles.
+    """
     global vectorstore, files_indexed, sections_indexed
     index_faiss = index_dir / "index.faiss"
     index_pkl = index_dir / "index.pkl"
     metadata_path = index_dir / "metadata.json"
 
     if not index_faiss.exists() or not index_pkl.exists():
-        return 0, 0
+        return 0, 0  # no saved index — caller should POST /index
 
     metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
+    # If the embedding model changed, the saved vectors are incompatible — skip loading
     if metadata.get("embedding_model") != EMBEDDING_MODEL:
         return 0, 0
 
@@ -142,6 +187,8 @@ def load_vector_index(index_dir: Path = INDEX_DIR) -> tuple[int, int]:
 
 
 def search(query: str, k: int = 3) -> list[tuple[Document, float]]:
+    # similarity_search_with_score returns (Document, distance) pairs.
+    # Lower distance = more similar for FAISS L2; higher = more similar for cosine.
     if vectorstore is None:
         return []
     return vectorstore.similarity_search_with_score(query, k=k)
